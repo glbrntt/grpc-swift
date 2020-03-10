@@ -72,6 +72,16 @@ let package = Package(
     ),
 
     .target(
+      name: "ZipBomb",
+      dependencies: [
+        "GRPC",
+        "GRPCInteroperabilityTestModels",
+        "NIO",
+        "SwiftProtobuf",
+      ]
+    ),
+
+    .target(
       name: "CGRPCZlib",
       linkerSettings: [
         .linkedLibrary("z")
