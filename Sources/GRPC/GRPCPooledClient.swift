@@ -29,6 +29,8 @@ public final class GRPCPooledClient: GRPCChannel {
   public init(configuration: Configuration) {
     self.group = configuration.group
     self.pool = ConnectionPool(
+      host: configuration.host,
+      port: configuration.port,
       group: configuration.group,
       queue: configuration.queue,
       maximumConnections: configuration.maximumPoolSize,
@@ -73,7 +75,14 @@ public final class GRPCPooledClient: GRPCChannel {
   }
 
   public func close() -> EventLoopFuture<Void> {
-    fatalError()
+    let eventLoop = self.group.next()
+    let promise = eventLoop.makePromise(of: Void.self)
+    self.close(promise: promise)
+    return promise.futureResult
+  }
+
+  public func close(promise: EventLoopPromise<Void>) {
+    self.pool.shutdown(promise: promise)
   }
 }
 
@@ -106,20 +115,35 @@ extension GRPCPooledClient {
 
 
 final class ConnectionPool {
+  private var host: String
+  private var port: Int
+
   private var connections: [ObjectIdentifier: ConnectionAndState]
   private var connectionWaiters: CircularBuffer<Waiter>
   private var nextConnectionThreshold: Int
+  private var state: State = .active
   private let queue: DispatchQueue
   private var logger: Logger
 
+  private enum State {
+    case active
+    case shuttingDown(EventLoopFuture<Void>)
+    case shutdown
+  }
+
   init(
+    host: String,
+    port: Int,
     group: EventLoopGroup,
     queue: DispatchQueue,
     maximumConnections: Int,
-    connectionBringUpThreshold: Int  = 10,
+    connectionBringUpThreshold: Int = 10,
     logger: Logger
   ) {
     precondition(maximumConnections > 0)
+
+    self.host = host
+    self.port = port
 
     self.nextConnectionThreshold = connectionBringUpThreshold
     self.queue = queue
@@ -133,24 +157,69 @@ final class ConnectionPool {
     self.logger.debug("Making connection pool", metadata: ["pool_size": "\(maximumConnections)"])
 
     for _ in 0 ..< maximumConnections {
-      self.addManagerToPool(Self.makeConnectionManager(group: group, queue: queue, logger: logger))
+      self.addManagerToPool(self.makeConnectionManager(eventLoop: group.next()))
     }
   }
 
-  private static func makeConnectionManager(group: EventLoopGroup, queue: DispatchQueue, logger: Logger) -> ConnectionManager {
+  private func makeConnectionManager(eventLoop: EventLoop) -> ConnectionManager {
     // TODO: proper configuration.
     let configuration = ClientConnection.Configuration(
-      target: .hostAndPort("", 0),
-      eventLoopGroup: group.next(),
-      connectivityStateDelegateQueue: queue,
+      target: .hostAndPort(self.host, self.port),
+      eventLoopGroup: eventLoop,
+      connectivityStateDelegateQueue: self.queue,
       callStartBehavior: .waitsForConnectivity,
-      backgroundActivityLogger: logger
+      backgroundActivityLogger: self.logger
     )
 
-    return ConnectionManager(
-      configuration: configuration,
-      logger: logger
-    )
+    return ConnectionManager(configuration: configuration, logger: self.logger)
+  }
+
+  internal func getMultiplexer(eventLoop: EventLoop) -> EventLoopFuture<HTTP2StreamMultiplexer> {
+    let promise = eventLoop.makePromise(of: ConnectionDetails.self)
+
+    self.queue.async {
+      self.getMultiplexer(promise: promise)
+    }
+
+    // TODO: what are we doing with ELs here?
+    return promise.futureResult.flatMap { details in
+      return details.eventLoop.makeSucceededFuture(details.multiplexer)
+    }
+  }
+
+  internal func shutdown(promise: EventLoopPromise<Void>) {
+    let eventLoop = promise.futureResult.eventLoop
+
+    self.queue.async {
+      switch self.state {
+      case .active:
+        self.state = .shuttingDown(promise.futureResult)
+
+        promise.futureResult.whenComplete { _ in
+          self.shutdownCompleted()
+        }
+
+        let shutdownFutures = self.connections.values.map {
+          $0.connectionManager.shutdown()
+        }
+
+        EventLoopFuture.andAllSucceed(shutdownFutures, on: eventLoop)
+          .cascade(to: promise)
+
+      case let .shuttingDown(future):
+        promise.completeWith(future)
+
+      case .shutdown:
+        // TODO: or fail?
+        promise.succeed(())
+      }
+    }
+  }
+
+  private func shutdownCompleted() {
+    self.queue.async {
+      self.state = .shutdown
+    }
   }
 
   private func addManagerToPool(_ manager: ConnectionManager) {
@@ -166,19 +235,6 @@ final class ConnectionPool {
 
   private func getUsableConnections() -> [ConnectionAndState] {
     return self.connections.values.filter { $0.availableLeases > 0 }
-  }
-
-  internal func getMultiplexer(eventLoop: EventLoop) -> EventLoopFuture<HTTP2StreamMultiplexer> {
-    let promise = eventLoop.makePromise(of: ConnectionDetails.self)
-
-    self.queue.async {
-      self.getMultiplexer(promise: promise)
-    }
-
-    // TODO: what are we doing with ELs here?
-    return promise.futureResult.flatMap { details in
-      return details.eventLoop.makeSucceededFuture(details.multiplexer)
-    }
   }
 
   private func getMultiplexer(promise: EventLoopPromise<ConnectionDetails>) {
@@ -247,7 +303,9 @@ final class ConnectionPool {
     self.connections[connectionID]?.willStartConnecting(multiplexer: promise.futureResult)
 
     promise.futureResult.whenSuccessBlocking(onto: self.queue) { multiplexer in
+      self.logger.trace("connection ready", metadata: ["connection_id": "\(connectionID)"])
       self.connections[connectionID]?.connected(multiplexer: multiplexer)
+      self.serviceWaiters()
     }
 
     promise.futureResult.whenFailureBlocking(onto: self.queue) { error in
@@ -257,7 +315,7 @@ final class ConnectionPool {
 
     // Start connecting.
     // TODO: we need to ensure that the right call start behaviour is used.
-    self.logger.trace("Starting connection attempt", metadata: ["connection_id": "\(connectionID)"])
+    self.logger.trace("starting connection", metadata: ["connection_id": "\(connectionID)"])
     promise.completeWith(connection.connectionManager.getHTTP2Multiplexer())
   }
 
@@ -266,6 +324,9 @@ final class ConnectionPool {
     forConnection connectionID: ObjectIdentifier
   ) {
     self.queue.assertOnQueue()
+    self.logger.trace("Connectivity state changed to \(state)", metadata: [
+      "connection_id": "\(connectionID)"
+    ])
 
     if let action = self.connections[connectionID]?.connectivityStateChanged(to: state) {
       switch action {
@@ -290,12 +351,9 @@ final class ConnectionPool {
     // The connection is quiescing, remove it and replace it with a new one on that same event
     // loop. We don't need to shut down the connection, it will do so once fully quiesced.
     if let connection = self.connections.removeValue(forKey: connectionID) {
-      let connectionManager = Self.makeConnectionManager(
-        group: connection.connectionManager.eventLoop,
-        queue: self.queue,
-        logger: self.logger
+      let connectionManager = self.makeConnectionManager(
+        eventLoop: connection.connectionManager.eventLoop
       )
-
       self.addManagerToPool(connectionManager)
     }
   }
