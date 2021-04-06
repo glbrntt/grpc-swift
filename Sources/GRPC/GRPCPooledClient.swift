@@ -110,7 +110,7 @@ final class ConnectionPool {
   private var connectionWaiters: CircularBuffer<Waiter>
   private var nextConnectionThreshold: Int
   private let queue: DispatchQueue
-  private let logger: Logger
+  private var logger: Logger
 
   init(
     group: EventLoopGroup,
@@ -121,8 +121,6 @@ final class ConnectionPool {
   ) {
     precondition(maximumConnections > 0)
 
-    logger.debug("Creating connection pool", metadata: ["pool_size": "\(maximumConnections)"])
-
     self.nextConnectionThreshold = connectionBringUpThreshold
     self.queue = queue
     self.logger = logger
@@ -130,6 +128,10 @@ final class ConnectionPool {
 
     self.connections = [:]
     self.connections.reserveCapacity(maximumConnections)
+
+    self.logger[metadataKey: "pool_id"] = "\(ObjectIdentifier(self))"
+    self.logger.debug("Making connection pool", metadata: ["pool_size": "\(maximumConnections)"])
+
     for _ in 0 ..< maximumConnections {
       self.addManagerToPool(Self.makeConnectionManager(group: group, queue: queue, logger: logger))
     }
@@ -155,6 +157,10 @@ final class ConnectionPool {
     let connectionAndState = ConnectionAndState(connectionManager: manager)
     // TODO: is there a ref-cycle here?
     manager.monitor.delegate = ConnectivityMonitor(pool: self, connectionID: connectionAndState.id)
+
+    self.logger.trace("Adding connection to pool", metadata: [
+      "connection_id": "\(connectionAndState.id)"
+    ])
     self.connections[connectionAndState.id] = connectionAndState
   }
 
@@ -169,6 +175,7 @@ final class ConnectionPool {
       self.getMultiplexer(promise: promise)
     }
 
+    // TODO: what are we doing with ELs here?
     return promise.futureResult.flatMap { details in
       return details.eventLoop.makeSucceededFuture(details.multiplexer)
     }
@@ -187,6 +194,10 @@ final class ConnectionPool {
 
       // We know there are available leases, so the force unwrap is fine.
       let connectionDetails = self.connections[connection.id]!.leaseStream()!
+
+      self.logger.trace("Leasing stream from existing connection", metadata: [
+        "connection_id": "\(connection.id)"
+      ])
       promise.succeed(connectionDetails)
     } else {
       requestAnotherConnection = true
@@ -213,6 +224,9 @@ final class ConnectionPool {
     }
 
     self.connectionWaiters.append(waiter)
+    self.logger.trace("Enqueued connection waiter", metadata: [
+      "num_waiters": "\(self.connectionWaiters.count)"
+    ])
   }
 
   private func requestConnection() {
@@ -243,6 +257,7 @@ final class ConnectionPool {
 
     // Start connecting.
     // TODO: we need to ensure that the right call start behaviour is used.
+    self.logger.trace("Starting connection attempt", metadata: ["connection_id": "\(connectionID)"])
     promise.completeWith(connection.connectionManager.getHTTP2Multiplexer())
   }
 
@@ -261,6 +276,9 @@ final class ConnectionPool {
         self.serviceWaiters()
 
       case .removeFromConnectionList:
+        self.logger.trace("Removing connection from pool", metadata: [
+          "connection_id": "\(connectionID)"
+        ])
         self.connections.removeValue(forKey: connectionID)
       }
     }
@@ -287,6 +305,10 @@ final class ConnectionPool {
       return
     }
 
+    self.logger.trace("Servicing connection waiters", metadata: [
+      "num_waiters": "\(self.connectionWaiters.count)"
+    ])
+
     // Sort connections by the number of streams available for lease.
     var usableConnections = self.getUsableConnections()
     usableConnections.sort(by: { $0.availableLeases < $1.availableLeases })
@@ -299,6 +321,13 @@ final class ConnectionPool {
       // force unwrapping is okay.
       let multiplexer = connection.leaseStreams(leases)!
       self.connections.updateValue(connection, forKey: connection.id)
+
+      self.logger.trace("Leasing streams", metadata: [
+        "connection_id": "\(connection.id)",
+        "new_leases": "\(leases)",
+        "available_leases": "\(connection.availableLeases)",
+        "num_waiters": "\(self.connectionWaiters.count - leases)"
+      ])
 
       for _ in 0 ..< leases {
         let waiter = self.connectionWaiters.removeFirst()
