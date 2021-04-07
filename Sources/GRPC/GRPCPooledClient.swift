@@ -113,7 +113,6 @@ extension GRPCPooledClient {
   }
 }
 
-
 final class ConnectionPool {
   private var host: String
   private var port: Int
