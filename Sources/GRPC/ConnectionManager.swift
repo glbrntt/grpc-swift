@@ -297,7 +297,7 @@ internal final class ConnectionManager {
     )
   }
 
-  private init(
+  internal init(
     eventLoop: EventLoop,
     channelProvider: ConnectionManagerChannelProvider,
     callStartBehavior: CallStartBehavior.Behavior,

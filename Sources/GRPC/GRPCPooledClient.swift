@@ -71,7 +71,23 @@ public final class GRPCPooledClient: GRPCChannel {
     callOptions: CallOptions,
     interceptors: [ClientInterceptor<Request, Response>]
   ) -> Call<Request, Response> {
-    fatalError()
+    let eventLoop = callOptions.eventLoopPreference.exact ?? self.group.next()
+    let multiplexer = self.pool.getMultiplexer(eventLoop: eventLoop)
+    let call = Call(
+      path: path,
+      type: type,
+      eventLoop: eventLoop,
+      options: callOptions,
+      interceptors: interceptors,
+      transportFactory: .http2(
+        multiplexer: multiplexer,
+        authority: self.authority,
+        scheme: self.scheme,
+        errorDelegate: nil
+      )
+    )
+
+    return call
   }
 
   public func close() -> EventLoopFuture<Void> {
@@ -114,15 +130,13 @@ extension GRPCPooledClient {
 }
 
 final class ConnectionPool {
-  private var host: String
-  private var port: Int
-
-  private var connections: [ObjectIdentifier: ConnectionAndState]
+  private var connections: [ObjectIdentifier: MultiplexerManager]
   private var connectionWaiters: CircularBuffer<Waiter>
   private var nextConnectionThreshold: Int
   private var state: State = .active
   private let queue: DispatchQueue
   private var logger: Logger
+  private let channelProvider: DefaultChannelProvider
 
   private enum State {
     case active
@@ -140,50 +154,42 @@ final class ConnectionPool {
     logger: Logger
   ) {
     precondition(maximumConnections > 0)
-
-    self.host = host
-    self.port = port
-
     self.nextConnectionThreshold = connectionBringUpThreshold
     self.queue = queue
     self.logger = logger
-    self.connectionWaiters = CircularBuffer(initialCapacity: 16)
+    self.channelProvider = DefaultChannelProvider(
+      connectionTarget: .hostAndPort(host, port),
+      connectionKeepalive: ClientConnectionKeepalive(),
+      connectionIdleTimeout: .minutes(5),
+      tlsConfiguration: nil,
+      tlsHostnameOverride: nil,
+      tlsCustomVerificationCallback: nil,
+      httpTargetWindowSize: 65535,
+      errorDelegate: nil,
+      debugChannelInitializer: nil
+    )
 
+    self.connectionWaiters = CircularBuffer(initialCapacity: 16)
     self.connections = [:]
     self.connections.reserveCapacity(maximumConnections)
 
     self.logger[metadataKey: "pool_id"] = "\(ObjectIdentifier(self))"
     self.logger.debug("Making connection pool", metadata: ["pool_size": "\(maximumConnections)"])
 
+    // Fill the pool with managed connections (they'll be idle).
     for _ in 0 ..< maximumConnections {
-      self.addManagerToPool(self.makeConnectionManager(eventLoop: group.next()))
+      self.addNewMultiplexerManagerToPool(on: group.next())
     }
   }
 
-  private func makeConnectionManager(eventLoop: EventLoop) -> ConnectionManager {
-    // TODO: proper configuration.
-    let configuration = ClientConnection.Configuration(
-      target: .hostAndPort(self.host, self.port),
-      eventLoopGroup: eventLoop,
-      connectivityStateDelegateQueue: self.queue,
-      callStartBehavior: .waitsForConnectivity,
-      backgroundActivityLogger: self.logger
-    )
-
-    return ConnectionManager(configuration: configuration, logger: self.logger)
-  }
-
   internal func getMultiplexer(eventLoop: EventLoop) -> EventLoopFuture<HTTP2StreamMultiplexer> {
-    let promise = eventLoop.makePromise(of: ConnectionDetails.self)
+    let promise = eventLoop.makePromise(of: HTTP2StreamMultiplexer.self)
 
     self.queue.async {
       self.getMultiplexer(promise: promise)
     }
 
-    // TODO: what are we doing with ELs here?
-    return promise.futureResult.flatMap { details in
-      return details.eventLoop.makeSucceededFuture(details.multiplexer)
-    }
+    return promise.futureResult
   }
 
   internal func shutdown(promise: EventLoopPromise<Void>) {
@@ -202,8 +208,8 @@ final class ConnectionPool {
           $0.connectionManager.shutdown()
         }
 
-        EventLoopFuture.andAllSucceed(shutdownFutures, on: eventLoop)
-          .cascade(to: promise)
+        // TODO: use the 'promise' accepting version when it's released to save an allocation.
+        EventLoopFuture.andAllSucceed(shutdownFutures, on: eventLoop).cascade(to: promise)
 
       case let .shuttingDown(future):
         promise.completeWith(future)
@@ -221,22 +227,60 @@ final class ConnectionPool {
     }
   }
 
-  private func addManagerToPool(_ manager: ConnectionManager) {
-    let connectionAndState = ConnectionAndState(connectionManager: manager)
-    // TODO: is there a ref-cycle here?
-    manager.monitor.delegate = ConnectivityMonitor(pool: self, connectionID: connectionAndState.id)
+  private func addNewMultiplexerManagerToPool(on eventLoop: EventLoop) {
+    let connectionManager = ConnectionManager(
+      eventLoop: eventLoop,
+      channelProvider: self.channelProvider,
+      callStartBehavior: .waitsForConnectivity,
+      connectionBackoff: ConnectionBackoff(),
+      // This is set just below (we need the object identifier).
+      connectivityStateDelegate: nil,
+      connectivityStateDelegateQueue: self.queue,
+      logger: self.logger
+    )
+
+    let muxManager = MultiplexerManager(connectionManager: connectionManager)
+
+    // When do we break this reference cycle?
+    muxManager.connectionManager.monitor.delegate = ConnectivityMonitor(
+      forMultiplexerManager: muxManager,
+      inPool: self
+    )
+
+    // This isn't part of the connectivity delegate API and we don't really want it to be. This is
+    // just a convenient place to put it as it's executed on the right `DispatchQueue`.
+    muxManager.connectionManager.monitor.httpNotifications(
+      onStreamClosed: { self.returnLease(forConnection: muxManager.id) },
+      onMaxConcurrentStreamChanged: { self.updateMaximumLeases($0, forConnection: muxManager.id) }
+    )
 
     self.logger.trace("Adding connection to pool", metadata: [
-      "connection_id": "\(connectionAndState.id)"
+      "connection_id": "\(muxManager.id)"
     ])
-    self.connections[connectionAndState.id] = connectionAndState
+
+    self.connections[muxManager.id] = muxManager
   }
 
-  private func getUsableConnections() -> [ConnectionAndState] {
-    return self.connections.values.filter { $0.availableLeases > 0 }
+  private func makeConnectivityStateDelegate(
+    forConnectionIdentifiedBy id: ObjectIdentifier,
+    inPool pool: ConnectionPool
+  ) -> ConnectivityStateDelegate {
+    return ConnectivityMonitor(pool: self, connectionID: id)
   }
 
-  private func getMultiplexer(promise: EventLoopPromise<ConnectionDetails>) {
+  private func getUsableConnections() -> [MultiplexerManager] {
+    return self.connections.values.filter {
+      $0.availableLeases > 0
+    }
+  }
+
+  private func getLeastUsedUsableConnection() -> MultiplexerManager? {
+    return self.getUsableConnections().min { lhs, rhs in
+      lhs.availableLeases < rhs.availableLeases
+    }
+  }
+
+  private func getMultiplexer(promise: EventLoopPromise<HTTP2StreamMultiplexer>) {
     self.queue.assertOnQueue()
 
     let requestAnotherConnection: Bool
@@ -264,17 +308,15 @@ final class ConnectionPool {
     }
   }
 
-  private func makeWaiter(promise: EventLoopPromise<ConnectionDetails>) {
+  private func makeWaiter(promise: EventLoopPromise<HTTP2StreamMultiplexer>) {
     var waiter = Waiter(multiplexerPromise: promise)
 
-    waiter.scheduleDeadline(.now() + .seconds(10), onEventLoop: promise.futureResult.eventLoop) {
-      self.queue.async {
-        // TODO: use a better error.
-        waiter.fail(GRPCError.AlreadyComplete())
+    waiter.scheduleDeadline(.now() + .seconds(10), onQueue: self.queue) {
+      // TODO: use a better error.
+      waiter.fail(GRPCError.AlreadyComplete())
 
-        if let index = self.connectionWaiters.firstIndex(where: { $0.id == waiter.id }) {
-          self.connectionWaiters.remove(at: index)
-        }
+      if let index = self.connectionWaiters.firstIndex(where: { $0.id == waiter.id }) {
+        self.connectionWaiters.remove(at: index)
       }
     }
 
@@ -304,16 +346,10 @@ final class ConnectionPool {
     promise.futureResult.whenSuccessBlocking(onto: self.queue) { multiplexer in
       self.logger.trace("connection ready", metadata: ["connection_id": "\(connectionID)"])
       self.connections[connectionID]?.connected(multiplexer: multiplexer)
-      self.serviceWaiters()
-    }
-
-    promise.futureResult.whenFailureBlocking(onto: self.queue) { error in
-      // TODO: failed to get a multiplexer, bugger.
-      fatalError()
+      self.tryServicingManyWaiters()
     }
 
     // Start connecting.
-    // TODO: we need to ensure that the right call start behaviour is used.
     self.logger.trace("starting connection", metadata: ["connection_id": "\(connectionID)"])
     promise.completeWith(connection.connectionManager.getHTTP2Multiplexer())
   }
@@ -333,15 +369,49 @@ final class ConnectionPool {
         self.startConnecting(connectionID: connectionID)
 
       case .checkWaiters:
-        self.serviceWaiters()
+        self.tryServicingManyWaiters()
 
       case .removeFromConnectionList:
         self.logger.trace("Removing connection from pool", metadata: [
           "connection_id": "\(connectionID)"
         ])
-        self.connections.removeValue(forKey: connectionID)
+        self.removeManagerFromPool(identifiedBy: connectionID)
       }
     }
+  }
+
+  private func returnLease(forConnection connectionID: ObjectIdentifier) {
+    self.queue.assertOnQueue()
+    self.logger.trace("Returning lease", metadata: [
+      "connection_id": "\(connectionID)"
+    ])
+    self.connections[connectionID]?.returnStream()
+    self.tryServivingOneWaiter()
+  }
+
+  private func updateMaximumLeases(_ limit: Int, forConnection connectionID: ObjectIdentifier) {
+    self.queue.assertOnQueue()
+
+    if let oldLimit = self.connections[connectionID]?.updateMaximumLeases(limit), limit > oldLimit {
+      // Only try to service waiters if the limit increased.
+      self.tryServicingManyWaiters()
+    }
+  }
+
+  @discardableResult
+  private func removeManagerFromPool(identifiedBy id: ObjectIdentifier) -> MultiplexerManager? {
+    guard let manager = self.connections.removeValue(forKey: id) else {
+      return nil
+    }
+
+    // The monitor has references to this pool, we'll break those cycles now.
+    manager.connectionManager.monitor.delegate = nil
+    manager.connectionManager.monitor.httpNotifications(
+      onStreamClosed: nil,
+      onMaxConcurrentStreamChanged: nil
+    )
+
+    return manager
   }
 
   private func connectionIsQuiescing(connectionID: ObjectIdentifier) {
@@ -349,16 +419,40 @@ final class ConnectionPool {
 
     // The connection is quiescing, remove it and replace it with a new one on that same event
     // loop. We don't need to shut down the connection, it will do so once fully quiesced.
-    if let connection = self.connections.removeValue(forKey: connectionID) {
-      let connectionManager = self.makeConnectionManager(
-        eventLoop: connection.connectionManager.eventLoop
-      )
-      self.addManagerToPool(connectionManager)
+    if let connection = self.removeManagerFromPool(identifiedBy: connectionID) {
+      self.addNewMultiplexerManagerToPool(on: connection.connectionManager.eventLoop)
     }
   }
 
-  private func serviceWaiters() {
-    if self.connectionWaiters.isEmpty {
+  private func tryServivingOneWaiter() {
+    guard self.connectionWaiters.count > 0,
+          var usableConnection = self.getLeastUsedUsableConnection() else {
+      return
+    }
+
+    self.logger.trace("Servicing at most one connection waiter", metadata: [
+      "num_waiters": "\(self.connectionWaiters.count)"
+    ])
+
+
+    // The connection has an available stream and we're only leasing one, so force unwrap is okay.
+    let multiplexer = usableConnection.leaseStream()!
+    self.connections.updateValue(usableConnection, forKey: usableConnection.id)
+
+    let waiter = self.connectionWaiters.removeFirst()
+
+    self.logger.trace("Leasing stream", metadata: [
+      "connection_id": "\(usableConnection.id)",
+      "new_leases": "\(1)",
+      "available_leases": "\(usableConnection.availableLeases)",
+      "num_waiters": "\(self.connectionWaiters.count)"
+    ])
+
+    waiter.succeed(multiplexer)
+  }
+
+  private func tryServicingManyWaiters() {
+    guard self.connectionWaiters.count > 0 else {
       return
     }
 
@@ -399,6 +493,11 @@ extension ConnectionPool {
     private let connectionID: ObjectIdentifier
     private let pool: ConnectionPool
 
+    init(forMultiplexerManager manager: MultiplexerManager, inPool pool: ConnectionPool) {
+      self.connectionID = manager.id
+      self.pool = pool
+    }
+
     init(pool: ConnectionPool, connectionID: ObjectIdentifier) {
       self.connectionID = connectionID
       self.pool = pool
@@ -417,51 +516,56 @@ extension ConnectionPool {
   }
 }
 
-struct Waiter {
-  private var promise: EventLoopPromise<ConnectionDetails>
-  private var timeoutTask: Scheduled<Void>?
+extension ConnectionPool {
+  struct Waiter {
+    private var multiplexerPromise: EventLoopPromise<HTTP2StreamMultiplexer>
+    private var timeoutTask: Optional<DispatchWorkItem>
 
-  var multiplexer: EventLoopFuture<ConnectionDetails> {
-    // TODO: this is *not* necessarily on the event loop of the multiplexer.
-    return self.promise.futureResult
-  }
+    var multiplexer: EventLoopFuture<HTTP2StreamMultiplexer> {
+      return self.multiplexerPromise.futureResult
+    }
 
-  var id: ObjectIdentifier {
-    return ObjectIdentifier(self.multiplexer)
-  }
+    var id: ObjectIdentifier {
+      return ObjectIdentifier(self.multiplexer)
+    }
 
-  init(multiplexerPromise: EventLoopPromise<ConnectionDetails>) {
-    self.promise = multiplexerPromise
-  }
+    init(multiplexerPromise: EventLoopPromise<HTTP2StreamMultiplexer>) {
+      self.multiplexerPromise = multiplexerPromise
+      self.timeoutTask = nil
+    }
 
-  mutating func scheduleDeadline(
-    _ deadline: NIODeadline,
-    onEventLoop eventLoop: EventLoop,
-    onTimeout: @escaping () -> Void
-  ) {
-    assert(self.timeoutTask == nil)
-    self.timeoutTask = eventLoop.scheduleTask(deadline: deadline, onTimeout)
-  }
+    mutating func scheduleDeadline(
+      _ deadline: DispatchTime,
+      onQueue queue: DispatchQueue,
+      onTimeout execute: @escaping () -> Void
+    ) {
+      assert(self.timeoutTask == nil)
 
-  func succeed(_ multiplexer: ConnectionDetails) {
-    self.timeoutTask?.cancel()
-    self.promise.succeed(multiplexer)
-  }
+      let workItem = DispatchWorkItem(block: execute)
+      self.timeoutTask = workItem
+      queue.asyncAfter(deadline: deadline, execute: workItem)
+    }
 
-  func fail(_ error: Error) {
-    self.timeoutTask?.cancel()
-    self.promise.fail(error)
+    func succeed(_ multiplexer: HTTP2StreamMultiplexer) {
+      self.timeoutTask?.cancel()
+      self.multiplexerPromise.succeed(multiplexer)
+    }
+
+    func fail(_ error: Error) {
+      self.timeoutTask?.cancel()
+      self.multiplexerPromise.fail(error)
+    }
   }
 }
 
-struct ConnectionAndState {
-  /// A manager for the connection we're leasing.
+struct MultiplexerManager {
+  /// A manager for the multiplexer we're leasing streams from.
   internal let connectionManager: ConnectionManager
 
   /// The maximum number of times we can lease out the multiplexer from our managed connection.
   /// Assuming each lease corresponds to a single HTTP/2 stream then this should match the value
   /// of `SETTINGS_MAX_CONCURRENT_STREAMS`.
-  internal private(set) var maximumLeases: Int
+  private var maximumLeases: Int
 
   /// Connection state.
   private var state: State
@@ -537,17 +641,17 @@ struct ConnectionAndState {
 
   // MARK: - Lease Management
 
-  mutating func leaseStream() -> ConnectionDetails? {
+  mutating func leaseStream() -> HTTP2StreamMultiplexer? {
     return self.leaseStreams(1)
   }
 
-  mutating func leaseStreams(_ extraLeases: Int) -> ConnectionDetails? {
+  mutating func leaseStreams(_ extraLeases: Int) -> HTTP2StreamMultiplexer? {
     switch self.state {
     case .ready(let multiplexer, var leases):
       leases += extraLeases
       self.state = .ready(multiplexer, leases)
       assert(leases <= self.maximumLeases)
-      return ConnectionDetails(multiplexer: multiplexer, eventLoop: self.connectionManager.eventLoop)
+      return multiplexer
 
     case .idle, .connectingOrBackingOff:
       preconditionFailure()
@@ -559,11 +663,16 @@ struct ConnectionAndState {
     case .ready(let multiplexer, var leases):
       leases -= 1
       self.state = .ready(multiplexer, leases)
-      assert(leases >= 0)
 
     case .idle, .connectingOrBackingOff:
       preconditionFailure()
     }
+  }
+
+  mutating func updateMaximumLeases(_ newValue: Int) -> Int {
+    let oldValue = self.maximumLeases
+    self.maximumLeases = newValue
+    return oldValue
   }
 
   mutating func willStartConnecting(multiplexer: EventLoopFuture<HTTP2StreamMultiplexer>) {

@@ -76,6 +76,9 @@ public class ConnectivityStateMonitor {
   private var _delegate: ConnectivityStateDelegate?
   private let delegateCallbackQueue: DispatchQueue
 
+  private var _onStreamClosed: Optional<() -> Void>
+  private var _onMaxConcurrentStreamsChanged: Optional<(Int) -> Void>
+
   /// Creates a new connectivity state monitor.
   ///
   /// - Parameter delegate: A delegate to call when the connectivity state changes.
@@ -83,6 +86,8 @@ public class ConnectivityStateMonitor {
   init(delegate: ConnectivityStateDelegate?, queue: DispatchQueue?) {
     self._delegate = delegate
     self.delegateCallbackQueue = queue ?? DispatchQueue(label: "io.grpc.connectivity")
+    self._onStreamClosed = nil
+    self._onMaxConcurrentStreamsChanged = nil
   }
 
   /// The current state of connectivity.
@@ -137,6 +142,36 @@ public class ConnectivityStateMonitor {
       if let delegate = self.delegate {
         delegate.connectionStartedQuiescing()
       }
+    }
+  }
+
+  internal func httpNotifications(
+    onStreamClosed: Optional<() -> Void>,
+    onMaxConcurrentStreamChanged: Optional<(Int) -> Void>
+  ) {
+    self.delegateLock.withLockVoid {
+      self._onStreamClosed = onStreamClosed
+      self._onMaxConcurrentStreamsChanged = onMaxConcurrentStreamChanged
+    }
+  }
+
+  internal func streamDidClose() {
+    guard let callback = self.delegateLock.withLock({ return self._onStreamClosed }) else {
+      return
+    }
+
+    self.delegateCallbackQueue.async {
+      callback()
+    }
+  }
+
+  internal func maxConcurrentStreamsDidChange(_ count: Int) {
+    guard let callback = self.delegateLock.withLock({ return self._onMaxConcurrentStreamsChanged }) else {
+      return
+    }
+
+    self.delegateCallbackQueue.async {
+      callback(count)
     }
   }
 }

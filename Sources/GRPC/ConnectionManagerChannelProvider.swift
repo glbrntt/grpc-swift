@@ -131,7 +131,7 @@ internal struct DefaultChannelProvider: ConnectionManagerChannelProvider {
         }
 
         // Run the debug initializer, if there is one.
-        if let debugInitializer = self.configuration.debugChannelInitializer {
+        if let debugInitializer = self.debugChannelInitializer {
           return debugInitializer(channel)
         } else {
           return channel.eventLoop.makeSucceededVoidFuture()

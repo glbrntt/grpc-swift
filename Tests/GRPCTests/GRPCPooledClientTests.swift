@@ -37,7 +37,7 @@ class GRPCPooledClientTests: GRPCTestCase {
 
     let configuration = GRPCPooledClient.Configuration(
       group: self.group,
-      maximumPoolSize: 4,
+      maximumPoolSize: 1,
       host: "127.0.0.1",
       port: self.server.channel.localAddress!.port!,
       queue: DispatchQueue(label: "io.grpc.pooled-client"),
@@ -59,7 +59,7 @@ class GRPCPooledClientTests: GRPCTestCase {
 
     let group = DispatchGroup()
 
-    for index in 0 ..< 100 {
+    for index in 0 ..< 300 {
       group.enter()
       let get = echo.get(.with { $0.text = "\(index)" })
       get.response.whenSuccess {

@@ -130,6 +130,12 @@ internal final class GRPCIdleHandler: ChannelInboundHandler {
       }
     }
 
+    // Max concurrent streams changed.
+    if let maxConcurrentStreams = operations.maxConcurrentStreamsChange,
+       let manager = self.mode.connectionManager {
+      manager.monitor.maxConcurrentStreamsDidChange(maxConcurrentStreams)
+    }
+
     // Handle idle timeout creation/cancellation.
     if let idleTask = operations.idleTask {
       switch idleTask {
@@ -223,6 +229,11 @@ internal final class GRPCIdleHandler: ChannelInboundHandler {
       self.perform(operations: self.stateMachine.streamClosed(withID: closed.streamID))
       self.handlePingAction(self.pingHandler.streamClosed())
       context.fireUserInboundEventTriggered(event)
+      // Notify the connectivity monitor that a stream closed: this is used to donate a stream back
+      // to the connection pool.
+      if case let .client(manager, _) = self.mode {
+        manager.monitor.streamDidClose()
+      }
     } else if event is ChannelShouldQuiesceEvent {
       self.perform(operations: self.stateMachine.initiateGracefulShutdown())
       // Swallow this event.
