@@ -138,6 +138,9 @@ final class ConnectionPool {
   private var logger: Logger
   private let channelProvider: DefaultChannelProvider
 
+  private let dispatchSourceTimer: DispatchSourceTimer
+  private var index = 0
+
   private enum State {
     case active
     case shuttingDown(EventLoopFuture<Void>)
@@ -173,6 +176,9 @@ final class ConnectionPool {
     self.connections = [:]
     self.connections.reserveCapacity(maximumConnections)
 
+    self.dispatchSourceTimer = DispatchSource.makeTimerSource(queue: self.queue)
+
+
     self.logger[metadataKey: "pool_id"] = "\(ObjectIdentifier(self))"
     self.logger.debug("Making connection pool", metadata: ["pool_size": "\(maximumConnections)"])
 
@@ -180,6 +186,14 @@ final class ConnectionPool {
     for _ in 0 ..< maximumConnections {
       self.addNewMultiplexerManagerToPool(on: group.next())
     }
+
+    self.dispatchSourceTimer.resume()
+  }
+
+  private func printPoolData() {
+//    let connsByID = self.connections.values.sorted(by: { $0.id < $1.id })
+//    print("POOL_DATA:\(self.index),\(self.connectionWaiters.count),\(connsByID.map { String($0.leases) }.joined(separator: ","))")
+//    self.index += 1
   }
 
   internal func getMultiplexer(eventLoop: EventLoop) -> EventLoopFuture<HTTP2StreamMultiplexer> {
@@ -199,6 +213,8 @@ final class ConnectionPool {
       switch self.state {
       case .active:
         self.state = .shuttingDown(promise.futureResult)
+        self.dispatchSourceTimer.suspend()
+        self.dispatchSourceTimer.setEventHandler(handler: nil)
 
         promise.futureResult.whenComplete { _ in
           self.shutdownCompleted()
@@ -427,6 +443,7 @@ final class ConnectionPool {
   private func tryServivingOneWaiter() {
     guard self.connectionWaiters.count > 0,
           var usableConnection = self.getLeastUsedUsableConnection() else {
+      self.printPoolData()
       return
     }
 
@@ -449,10 +466,12 @@ final class ConnectionPool {
     ])
 
     waiter.succeed(multiplexer)
+    self.printPoolData()
   }
 
   private func tryServicingManyWaiters() {
     guard self.connectionWaiters.count > 0 else {
+      self.printPoolData()
       return
     }
 
@@ -485,6 +504,8 @@ final class ConnectionPool {
         waiter.succeed(multiplexer)
       }
     }
+
+    self.printPoolData()
   }
 }
 

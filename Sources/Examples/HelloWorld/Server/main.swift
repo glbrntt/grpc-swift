@@ -23,8 +23,11 @@ struct HelloWorld: ParsableCommand {
   @Option(help: "The port to listen on for new connections")
   var port = 1234
 
+  @Option
+  var cores = System.coreCount / 2
+
   func run() throws {
-    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: self.cores)
     defer {
       try! group.syncShutdownGracefully()
     }
