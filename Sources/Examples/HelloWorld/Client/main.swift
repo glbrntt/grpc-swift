@@ -39,16 +39,13 @@ func greet(name: String?, client greeter: Helloworld_GreeterClient) {
   }
 }
 
-let queue = DispatchQueue(label: "runner")
+let queue = DispatchQueue(label: "runner", qos: .userInitiated)
 var count = 0
 var running = true
 
 struct HelloWorld: ParsableCommand {
   @Option(help: "The port to connect to")
   var port: Int = 1234
-
-  @Argument(help: "The name to greet")
-  var name: String?
 
   @Option(help: "The number of cores to use")
   var cores: Int = System.coreCount / 2
@@ -58,6 +55,13 @@ struct HelloWorld: ParsableCommand {
 
   @Option(help: "Duration (in seconds)")
   var duration: Int = 30
+
+  @Flag(help: "Use the connection pool")
+  var useConnectionPool = false
+
+  @Argument(help: "The name to greet")
+  var name: String?
+
 
   func run() throws {
     // Setup an `EventLoopGroup` for the connection to run on.
@@ -70,29 +74,66 @@ struct HelloWorld: ParsableCommand {
       try! group.syncShutdownGracefully()
     }
 
-    // Configure the channel, we're not using TLS so the connection is `insecure`.
-    let channel = GRPCPooledClient(
-      configuration: .init(
-        group: group,
-        maximumPoolSize: self.cores,
-        host: "localhost",
-        port: self.port,
-        queue: .init(label: "io.grpc.pool"),
-        logger: .init(label: "io.grpc", factory: { _ in SwiftLogNoOpLogHandler() })
-      )
-    )
+    print("test duration: \(self.duration) secs")
+    print("cores:", self.cores)
+    print("concurrent rpcs/core:", self.rpcsPerCore)
+    print("connection pool:", self.useConnectionPool)
 
-//    let channel = ClientConnection.insecure(group: group)
-//      .connect(host: "localhost", port: self.port)
-
-    // Close the connection when we're done with it.
-    defer {
-      try! channel.close().wait()
+    let request = Helloworld_HelloRequest.with {
+      $0.name = self.name ?? ""
     }
 
-    print("duration (s):", self.duration)
-    print("cores:", self.cores)
+    let host = "127.0.0.1"
 
+    if self.useConnectionPool {
+      let pool = GRPCPooledClient(
+        configuration: .init(
+          group: group,
+          maximumPoolSize: self.cores,
+          host: host,
+          port: self.port,
+          queue: .init(label: "io.grpc.pool"),
+          logger: .init(label: "io.grpc", factory: { _ in SwiftLogNoOpLogHandler() })
+        )
+      )
+
+      defer {
+        try! pool.close().wait()
+      }
+
+      let greeter = Helloworld_GreeterClient(channel: pool)
+      queue.async {
+        for _ in 0 ..< (self.cores * self.rpcsPerCore) {
+          self.startAnRPC(client: greeter, request: request)
+        }
+      }
+
+      self.waitForCompletion()
+    } else {
+      let channels = (0 ..< self.cores).map { _ in
+        ClientConnection.insecure(group: group.next()).connect(host: host, port: self.port)
+      }
+
+      defer {
+        channels.forEach {
+          try! $0.close().wait()
+        }
+      }
+
+      queue.async {
+        for channel in channels {
+          let greeter = Helloworld_GreeterClient(channel: channel)
+          for _ in 0 ..< self.rpcsPerCore {
+            self.startAnRPC(client: greeter, request: request)
+          }
+        }
+      }
+
+      self.waitForCompletion()
+    }
+  }
+
+  private func waitForCompletion() {
     let workItem = DispatchWorkItem {
       running = false
       let totalRPCs = count
@@ -101,18 +142,6 @@ struct HelloWorld: ParsableCommand {
       let perSecond = Double(totalRPCs) / Double(self.duration)
       print("rpcs/sec", perSecond)
       print("rpcs/sec/core:", perSecond / Double(self.cores))
-    }
-
-    // Provide the connection to the generated client.
-    let greeter = Helloworld_GreeterClient(channel: channel)
-    let request = Helloworld_HelloRequest.with {
-      $0.name = self.name ?? ""
-    }
-
-    let maxConcurrency = self.cores * self.rpcsPerCore
-
-    for _ in 0 ..< maxConcurrency {
-      self.startAnRPC(client: greeter, request: request)
     }
 
     queue.asyncAfter(deadline: .now() + .seconds(self.duration), execute: workItem)

@@ -35,7 +35,7 @@ struct HelloWorld: ParsableCommand {
     // Start the server and print its address once it has started.
     let server = Server.insecure(group: group)
       .withServiceProviders([GreeterProvider()])
-      .bind(host: "localhost", port: self.port)
+      .bind(host: "127.0.0.1", port: self.port)
 
     server.map {
       $0.channel.localAddress
