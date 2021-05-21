@@ -47,7 +47,7 @@
         }
       },
       {
-        "package": "SwiftProtobuf",
+        "package": "swift-protobuf",
         "repositoryURL": "https://github.com/apple/swift-protobuf.git",
         "state": {
           "branch": null,
