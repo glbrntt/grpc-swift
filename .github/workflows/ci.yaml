@@ -11,7 +11,7 @@ jobs:
     container:
       image: swift
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: "Formatting and License Headers check"
       run: |
         SWIFTFORMAT_VERSION=0.49.4
@@ -36,11 +36,13 @@ jobs:
     container:
       image: ${{ matrix.image }}
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: 🔧 Build
       run: swift build ${{ matrix.swift-build-flags }}
       timeout-minutes: 20
     - name: 🧪 Test
+      # Skip tests on 5.6: https://bugs.swift.org/browse/SR-15955
+      if: ${{ matrix.image != 'swift:5.6-focal' }}
       run: swift test ${{ matrix.swift-test-flags }}
       timeout-minutes: 20
   performance-tests:
@@ -83,7 +85,7 @@ jobs:
     container:
       image: ${{ matrix.image }}
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: 🧮 Allocation Counting Tests
       run: ./Performance/allocations/test-allocation-counts.sh
       env: ${{ matrix.env }}
@@ -101,7 +103,7 @@ jobs:
     container:
       image: ${{ matrix.image }}
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: Build without NIOSSL
       run: swift build
       env:

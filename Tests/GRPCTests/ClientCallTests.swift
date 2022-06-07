@@ -187,7 +187,7 @@ class ClientCallTests: GRPCTestCase {
 
   func testCancelBeforeInvoke() throws {
     let get = self.get()
-    assertThat(try get.cancel().wait(), .throws())
+    XCTAssertNoThrow(try get.cancel().wait())
   }
 
   func testCancelMidRPC() throws {

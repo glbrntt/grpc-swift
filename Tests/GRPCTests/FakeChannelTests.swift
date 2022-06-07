@@ -82,6 +82,10 @@ class FakeChannelTests: GRPCTestCase {
   }
 
   func testBidirectional() {
+    final class ResponseCollector {
+      private(set) var responses = [Response]()
+      func collect(_ response: Response) { self.responses.append(response) }
+    }
     var requests: [Request] = []
     let response = self.makeStreamingResponse { part in
       switch part {
@@ -92,10 +96,12 @@ class FakeChannelTests: GRPCTestCase {
       }
     }
 
-    var responses: [Response] = []
-    let call = self.makeBidirectionalStreamingCall {
-      responses.append($0)
+    var collector = ResponseCollector()
+    XCTAssertTrue(isKnownUniquelyReferenced(&collector))
+    let call = self.makeBidirectionalStreamingCall { [collector] in
+      collector.collect($0)
     }
+    XCTAssertFalse(isKnownUniquelyReferenced(&collector))
 
     XCTAssertNoThrow(try call.sendMessage(.with { $0.text = "1" }).wait())
     XCTAssertNoThrow(try call.sendMessage(.with { $0.text = "2" }).wait())
@@ -107,9 +113,12 @@ class FakeChannelTests: GRPCTestCase {
     XCTAssertNoThrow(try response.sendMessage(.with { $0.text = "4" }))
     XCTAssertNoThrow(try response.sendMessage(.with { $0.text = "5" }))
     XCTAssertNoThrow(try response.sendMessage(.with { $0.text = "6" }))
+    XCTAssertEqual(collector.responses.count, 3)
+    XCTAssertFalse(isKnownUniquelyReferenced(&collector))
     XCTAssertNoThrow(try response.sendEnd())
+    XCTAssertTrue(isKnownUniquelyReferenced(&collector))
 
-    XCTAssertEqual(responses, (4 ... 6).map { number in .with { $0.text = "\(number)" } })
+    XCTAssertEqual(collector.responses, (4 ... 6).map { number in .with { $0.text = "\(number)" } })
     XCTAssertTrue(try call.status.map { $0.isOk }.wait())
   }
 

@@ -254,7 +254,7 @@ extension ClientTransport {
       self.channelPromise?.fail(error)
       promise?.succeed(())
     } else {
-      promise?.fail(GRPCError.AlreadyComplete())
+      promise?.succeed(())
     }
   }
 }
