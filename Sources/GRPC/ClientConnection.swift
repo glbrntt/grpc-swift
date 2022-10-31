@@ -517,7 +517,15 @@ extension ClientConnection {
       self.callStartBehavior = callStartBehavior
       self.httpTargetWindowSize = httpTargetWindowSize
       self.backgroundActivityLogger = backgroundActivityLogger
-      self.debugChannelInitializer = debugChannelInitializer
+
+      let fn: Optional<@Sendable (Channel) -> EventLoopFuture<Void>>
+      if let debugChannelInitializer = debugChannelInitializer {
+        fn = debugChannelInitializer
+      } else {
+        fn = nil
+      }
+
+      self.debugChannelInitializer = fn
     }
     #else
     @available(*, deprecated, renamed: "default(target:eventLoopGroup:)")
