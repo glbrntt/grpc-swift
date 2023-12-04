@@ -523,6 +523,11 @@ extension Product {
     targets: ["GRPCCore"]
   )
 
+  static let grpcInProcessTransport: Product = .library(
+    name: "_GRPCInProcessTransport",
+    targets: ["GRPCInProcessTransport"]
+  )
+
   static let cgrpcZlib: Product = .library(
     name: cgrpcZlibProductName,
     targets: [cgrpcZlibTargetName]
@@ -553,6 +558,7 @@ let package = Package(
     .grpcCore,
     .cgrpcZlib,
     .grpcReflectionService,
+    .grpcInProcessTransport,
     .protocGenGRPCSwift,
     .grpcSwiftPlugin,
   ],
